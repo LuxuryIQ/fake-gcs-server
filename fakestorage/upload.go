@@ -15,9 +15,11 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/url"
+	"os"
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"cloud.google.com/go/storage"
@@ -104,17 +106,110 @@ type resumableUploadBody struct {
 	PredefinedACL      string            `json:"predefinedAcl"`
 }
 
+// resumableUploadTTL is how long a resumable upload session may sit idle
+// before it is discarded together with the content received so far.
+const resumableUploadTTL = time.Hour
+
 // resumableUploadEntry holds the in-progress object for a resumable upload
 // session along with state supplied when the session was initiated but only
 // applied when the upload is finalized: generation preconditions (e.g.
 // ifGenerationMatch) and any client-declared MD5/CRC32C checksums. GCS sends
 // both on the initiating request, but the object is only created on finalize,
 // so they must be carried across both requests.
+//
+// The content received so far is spooled to a temporary file, with its
+// checksums computed incrementally, instead of being held in memory.
 type resumableUploadEntry struct {
-	obj            Object
+	mu             sync.Mutex // guards everything below
+	obj            ObjectAttrs
 	conditions     preconditions
 	declaredMd5    string
 	declaredCrc32c string
+
+	file    *os.File // created along with the first chunk
+	hasher  *checksum.StreamingHasher
+	size    int64
+	touched time.Time
+	closed  bool
+}
+
+func newResumableUploadEntry(obj ObjectAttrs, conditions preconditions, declaredMd5, declaredCrc32c string) *resumableUploadEntry {
+	return &resumableUploadEntry{
+		obj:            obj,
+		conditions:     conditions,
+		declaredMd5:    declaredMd5,
+		declaredCrc32c: declaredCrc32c,
+		touched:        time.Now(),
+	}
+}
+
+// appendContent appends the content of r to the upload. If reading r fails,
+// the upload is left as it was before the call.
+func (e *resumableUploadEntry) appendContent(r io.Reader) error {
+	if e.file == nil {
+		f, err := os.CreateTemp("", "fake-gcs-server-upload-*")
+		if err != nil {
+			return err
+		}
+		e.file = f
+		e.hasher = checksum.NewStreamingHasher()
+	}
+	n, err := io.Copy(io.MultiWriter(e.file, e.hasher), r)
+	if err != nil {
+		return errors.Join(err, e.truncate(e.size))
+	}
+	e.size += n
+	return nil
+}
+
+// truncate drops the content past size, and recomputes the checksums.
+func (e *resumableUploadEntry) truncate(size int64) error {
+	if err := e.file.Truncate(size); err != nil {
+		return err
+	}
+	if _, err := e.file.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
+	e.hasher = checksum.NewStreamingHasher()
+	_, err := io.Copy(e.hasher, e.file)
+	return err
+}
+
+// release frees the temporary file. The caller must hold e.mu.
+func (e *resumableUploadEntry) release() {
+	e.closed = true
+	if e.file != nil {
+		e.file.Close()
+		os.Remove(e.file.Name())
+		e.file = nil
+	}
+}
+
+// storeUpload registers a resumable upload session, first dropping sessions
+// that have been idle for too long.
+func (s *Server) storeUpload(uploadID string, entry *resumableUploadEntry) {
+	now := time.Now()
+	s.removeUploads(func(e *resumableUploadEntry) bool {
+		return now.Sub(e.touched) > resumableUploadTTL
+	})
+	s.uploads.Store(uploadID, entry)
+}
+
+// removeUploads discards the upload sessions for which shouldRemove returns
+// true. Sessions that are receiving a chunk are skipped.
+func (s *Server) removeUploads(shouldRemove func(*resumableUploadEntry) bool) {
+	s.uploads.Range(func(key, value any) bool {
+		entry := value.(*resumableUploadEntry)
+		if !entry.mu.TryLock() {
+			return true
+		}
+		defer entry.mu.Unlock()
+		if shouldRemove(entry) {
+			s.uploads.Delete(key)
+			entry.release()
+		}
+		return true
+	})
 }
 
 // checkDeclaredChecksums verifies any client-declared MD5/CRC32C checksum
@@ -238,7 +333,7 @@ func (s *Server) handleBodyBasedResumableUpload(r *http.Request, body *resumable
 	if err != nil {
 		return jsonResponse{errorMessage: err.Error()}
 	}
-	s.uploads.Store(uploadID, resumableUploadEntry{obj: obj, conditions: conditions, declaredMd5: body.Md5Hash, declaredCrc32c: body.Crc32c})
+	s.storeUpload(uploadID, newResumableUploadEntry(obj.ObjectAttrs, conditions, body.Md5Hash, body.Crc32c))
 
 	// Create response headers
 	header := make(http.Header)
@@ -526,30 +621,30 @@ func (s *Server) multipartUpload(bucketName string, r *http.Request) jsonRespons
 			errorMessage: "invalid Content-Type header",
 		}
 	}
-	var (
-		metadata *multipartMetadata
-		content  []byte
-	)
-	var contentType string
 	reader := multipart.NewReader(r.Body, params["boundary"])
 
-	var partReaders []io.Reader
-
+	// The first part carries the metadata, the second one the media. The media
+	// is streamed into the backend, so it must be the last part to be read.
 	part, err := reader.NextPart()
-	for ; err == nil; part, err = reader.NextPart() {
-		if metadata == nil {
-			metadata, err = loadMetadata(part)
-			contentType = metadata.ContentType
-		} else {
-			contentType = part.Header.Get(contentTypeHeader)
-			content, err = loadContent(part)
-			partReaders = append(partReaders, bytes.NewReader(content))
+	if err != nil {
+		if err == io.EOF {
+			return jsonResponse{status: http.StatusBadRequest, errorMessage: "missing metadata part"}
 		}
-		if err != nil {
-			break
-		}
+		return jsonResponse{errorMessage: err.Error()}
 	}
-	if err != io.EOF {
+	metadata, err := loadMetadata(part)
+	if err != nil {
+		return jsonResponse{errorMessage: err.Error()}
+	}
+	contentType := metadata.ContentType
+	var content io.Reader = bytes.NewReader(nil)
+	part, err = reader.NextPart()
+	switch err {
+	case nil:
+		contentType = part.Header.Get(contentTypeHeader)
+		content = part
+	case io.EOF:
+	default:
 		return jsonResponse{errorMessage: err.Error()}
 	}
 
@@ -571,9 +666,13 @@ func (s *Server) multipartUpload(bucketName string, r *http.Request) jsonRespons
 		}
 	}
 
-	if err := checkDeclaredChecksums(metadata.Md5Hash, metadata.Crc32c,
-		checksum.EncodedMd5Hash(content), checksum.EncodedCrc32cChecksum(content)); err != nil {
-		return jsonResponse{status: http.StatusBadRequest, errorMessage: err.Error()}
+	// Declared checksums can only be verified once the whole content went
+	// through, in which case reading fails and nothing is stored.
+	verifier := &checksumVerifier{
+		Reader:         content,
+		hasher:         checksum.NewStreamingHasher(),
+		declaredMd5:    metadata.Md5Hash,
+		declaredCrc32c: metadata.Crc32c,
 	}
 
 	obj := StreamingObject{
@@ -591,15 +690,40 @@ func (s *Server) multipartUpload(bucketName string, r *http.Request) jsonRespons
 			Metadata:           metadata.Metadata,
 			Retention:          convertJsonRetentionToStorage(metadata.Retention),
 		},
-		Content: notImplementedSeeker{io.NopCloser(io.MultiReader(partReaders...))},
+		Content: notImplementedSeeker{io.NopCloser(verifier)},
 	}
 
 	obj, err = s.createObject(obj, conditions)
+	if verifier.err != nil {
+		return jsonResponse{status: http.StatusBadRequest, errorMessage: verifier.err.Error()}
+	}
 	if err != nil {
 		return errToJsonResponse(err)
 	}
 	defer obj.Close()
 	return jsonResponse{data: newObjectResponse(obj.ObjectAttrs, urlhelper.GetBaseURL(r))}
+}
+
+// checksumVerifier hashes what is read through it and, at the end of the
+// stream, fails the read if the content doesn't match the declared checksums.
+type checksumVerifier struct {
+	io.Reader
+	hasher         *checksum.StreamingHasher
+	declaredMd5    string
+	declaredCrc32c string
+	err            error
+}
+
+func (v *checksumVerifier) Read(p []byte) (int, error) {
+	n, err := v.Reader.Read(p)
+	v.hasher.Write(p[:n])
+	if err == io.EOF {
+		v.err = checkDeclaredChecksums(v.declaredMd5, v.declaredCrc32c, v.hasher.EncodedMd5Hash(), v.hasher.EncodedCrc32cChecksum())
+		if v.err != nil {
+			return n, v.err
+		}
+	}
+	return n, err
 }
 
 func parseContentTypeParams(requestContentType string) (map[string]string, error) {
@@ -655,7 +779,7 @@ func (s *Server) resumableUpload(bucketName string, r *http.Request) jsonRespons
 	if err != nil {
 		return jsonResponse{errorMessage: err.Error()}
 	}
-	s.uploads.Store(uploadID, resumableUploadEntry{obj: obj, conditions: conditions, declaredMd5: metadata.Md5Hash, declaredCrc32c: metadata.Crc32c})
+	s.storeUpload(uploadID, newResumableUploadEntry(obj.ObjectAttrs, conditions, metadata.Md5Hash, metadata.Crc32c))
 	header := make(http.Header)
 	location := fmt.Sprintf(
 		"%s/upload/storage/v1/b/%s/o?uploadType=resumable&name=%s&upload_id=%s",
@@ -712,36 +836,42 @@ func (s *Server) resumableUpload(bucketName string, r *http.Request) jsonRespons
 // set to "308".
 func (s *Server) uploadFileContent(r *http.Request) jsonResponse {
 	uploadID := r.URL.Query().Get("upload_id")
-	rawObj, ok := s.uploads.Load(uploadID)
+	rawEntry, ok := s.uploads.Load(uploadID)
 	if !ok {
 		return jsonResponse{status: http.StatusNotFound}
 	}
-	entry := rawObj.(resumableUploadEntry)
-	obj := entry.obj
-	// TODO: stream upload file content to and from disk (when using the FS
-	// backend, at least) instead of loading the entire content into memory.
-	content, err := loadContent(r.Body)
-	if err != nil {
-		return jsonResponse{errorMessage: err.Error()}
+	defer r.Body.Close()
+	entry := rawEntry.(*resumableUploadEntry)
+	entry.mu.Lock()
+	defer entry.mu.Unlock()
+	if entry.closed {
+		return jsonResponse{status: http.StatusNotFound}
 	}
+	entry.touched = time.Now()
 	commit := true
 	status := http.StatusOK
-	obj.Content = append(obj.Content, content...)
-	obj.Crc32c = checksum.EncodedCrc32cChecksum(obj.Content)
-	obj.Md5Hash = checksum.EncodedMd5Hash(obj.Content)
-	obj.Etag = obj.Md5Hash
-	contentTypeHeader := r.Header.Get(contentTypeHeader)
-	if contentTypeHeader != "" {
-		obj.ContentType = contentTypeHeader
-	} else if obj.ContentType == "" {
-		obj.ContentType = "application/octet-stream"
-	}
 	responseHeader := make(http.Header)
+	var parsed contentRange
+	hasContentRange := false
 	if contentRange := r.Header.Get("Content-Range"); contentRange != "" {
-		parsed, err := parseContentRange(contentRange)
+		var err error
+		parsed, err = parseContentRange(contentRange)
 		if err != nil {
 			return jsonResponse{errorMessage: err.Error(), status: http.StatusBadRequest}
 		}
+		hasContentRange = true
+	}
+	if err := entry.appendContent(r.Body); err != nil {
+		return jsonResponse{errorMessage: err.Error()}
+	}
+	entry.touched = time.Now()
+	contentTypeHeader := r.Header.Get(contentTypeHeader)
+	if contentTypeHeader != "" {
+		entry.obj.ContentType = contentTypeHeader
+	} else if entry.obj.ContentType == "" {
+		entry.obj.ContentType = "application/octet-stream"
+	}
+	if hasContentRange {
 		if parsed.KnownRange {
 			// Middle of streaming request, or any part of chunked request
 			responseHeader.Set("Range", fmt.Sprintf("bytes=0-%d", parsed.End))
@@ -749,24 +879,25 @@ func (s *Server) uploadFileContent(r *http.Request) jsonResponse {
 			commit = parsed.KnownTotal && (parsed.End+1 >= parsed.Total)
 		} else {
 			// End of a streaming request
-			responseHeader.Set("Range", fmt.Sprintf("bytes=0-%d", len(obj.Content)))
+			responseHeader.Set("Range", fmt.Sprintf("bytes=0-%d", entry.size))
 		}
 	}
+	obj := entry.obj
 	if commit {
-		if err := checkDeclaredChecksums(entry.declaredMd5, entry.declaredCrc32c, obj.Md5Hash, obj.Crc32c); err != nil {
-			s.uploads.Delete(uploadID)
+		s.uploads.Delete(uploadID)
+		defer entry.release()
+		if err := checkDeclaredChecksums(entry.declaredMd5, entry.declaredCrc32c, entry.hasher.EncodedMd5Hash(), entry.hasher.EncodedCrc32cChecksum()); err != nil {
 			return jsonResponse{status: http.StatusBadRequest, errorMessage: err.Error()}
 		}
-		s.uploads.Delete(uploadID)
-		streamingObject, err := s.createObject(obj.StreamingObject(), entry.conditions)
+		if _, err := entry.file.Seek(0, io.SeekStart); err != nil {
+			return jsonResponse{errorMessage: err.Error()}
+		}
+		streamingObject, err := s.createObject(StreamingObject{ObjectAttrs: obj, Content: entry.file}, entry.conditions)
 		if err != nil {
 			return errToJsonResponse(err)
 		}
 		defer streamingObject.Close()
-		obj, err = streamingObject.BufferedObject()
-		if err != nil {
-			return errToJsonResponse(err)
-		}
+		obj = streamingObject.ObjectAttrs
 	} else {
 		if _, no308 := r.Header["X-Guploader-No-308"]; no308 {
 			// Go client
@@ -775,14 +906,13 @@ func (s *Server) uploadFileContent(r *http.Request) jsonResponse {
 			// Python client
 			status = http.StatusPermanentRedirect
 		}
-		s.uploads.Store(uploadID, resumableUploadEntry{obj: obj, conditions: entry.conditions})
 	}
 	if r.Header.Get("X-Goog-Upload-Command") == "upload, finalize" {
 		responseHeader.Set("X-Goog-Upload-Status", "final")
 	}
 	return jsonResponse{
 		status: status,
-		data:   newObjectResponse(obj.ObjectAttrs, urlhelper.GetBaseURL(r)),
+		data:   newObjectResponse(obj, urlhelper.GetBaseURL(r)),
 		header: responseHeader,
 	}
 }
@@ -851,6 +981,12 @@ func parseContentRange(r string) (parsed contentRange, err error) {
 }
 
 func (s *Server) deleteResumableUpload(r *http.Request) jsonResponse {
+	if rawEntry, ok := s.uploads.LoadAndDelete(r.URL.Query().Get("upload_id")); ok {
+		entry := rawEntry.(*resumableUploadEntry)
+		entry.mu.Lock()
+		defer entry.mu.Unlock()
+		entry.release()
+	}
 	return jsonResponse{status: 499}
 }
 

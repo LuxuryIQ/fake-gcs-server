@@ -467,6 +467,7 @@ func (s *Server) publicHostMatcher(r *http.Request, rm *mux.RouteMatch) bool {
 // Stop stops the server, closing all connections.
 func (s *Server) Stop() {
 	s.transport.closed = true
+	s.removeUploads(func(*resumableUploadEntry) bool { return true })
 	if s.ts != nil {
 		s.ts.Close()
 	}

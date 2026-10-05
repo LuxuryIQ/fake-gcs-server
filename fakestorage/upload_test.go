@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"crypto/rand"
 	"crypto/tls"
 	"encoding/binary"
 	"encoding/json"
@@ -15,7 +16,10 @@ import (
 	"io"
 	"mime/multipart"
 	"net/http"
+	"net/textproto"
+	"os"
 	"reflect"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -2126,5 +2130,325 @@ func TestServerClientSimpleUploadIfGenerationMatch(t *testing.T) {
 	}
 	if string(obj.Content) != "v4" {
 		t.Fatalf("content after successful conditional write: want %q, got %q", "v4", string(obj.Content))
+	}
+}
+
+func randomContent(t testing.TB, size int) []byte {
+	t.Helper()
+	data := make([]byte, size)
+	if _, err := rand.Read(data); err != nil {
+		t.Fatal(err)
+	}
+	return data
+}
+
+// startResumableUpload initiates a resumable upload and returns the session
+// URL.
+func startResumableUpload(t testing.TB, server *Server, bucketName, objectName string, metadata string) string {
+	t.Helper()
+	url := fmt.Sprintf("%s/upload/storage/v1/b/%s/o?uploadType=resumable&name=%s", server.URL(), bucketName, objectName)
+	resp, err := server.HTTPClient().Post(url, "application/json", strings.NewReader(metadata))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("wrong status code starting upload: %d", resp.StatusCode)
+	}
+	return resp.Header.Get("Location")
+}
+
+// putChunk sends a chunk of a resumable upload and returns the response status.
+func putChunk(t testing.TB, server *Server, uploadURL string, chunk []byte, contentRange string) int {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodPut, uploadURL, bytes.NewReader(chunk))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Range", contentRange)
+	resp, err := server.HTTPClient().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, resp.Body)
+	return resp.StatusCode
+}
+
+func uploadChunks(t testing.TB, server *Server, uploadURL string, data []byte, chunkSize int) {
+	t.Helper()
+	for start := 0; start < len(data); start += chunkSize {
+		end := min(start+chunkSize, len(data))
+		contentRange := fmt.Sprintf("bytes %d-%d/%d", start, end-1, len(data))
+		wantStatus := http.StatusPermanentRedirect
+		if end == len(data) {
+			wantStatus = http.StatusOK
+		}
+		if status := putChunk(t, server, uploadURL, data[start:end], contentRange); status != wantStatus {
+			t.Fatalf("wrong status for %q\nwant %d\ngot  %d", contentRange, wantStatus, status)
+		}
+	}
+}
+
+func uploadSessionFiles(server *Server) []string {
+	var files []string
+	server.uploads.Range(func(_, value any) bool {
+		if entry := value.(*resumableUploadEntry); entry.file != nil {
+			files = append(files, entry.file.Name())
+		}
+		return true
+	})
+	return files
+}
+
+func TestServerResumableUploadChunked(t *testing.T) {
+	const bucketName = "testbucket"
+	data := randomContent(t, 5*256*1024+123)
+
+	runServersTest(t, runServersOptions{enableFSBackend: true}, func(t *testing.T, server *Server) {
+		server.CreateBucketWithOpts(CreateBucketOpts{Name: bucketName})
+
+		check := func(t *testing.T, objectName string) {
+			t.Helper()
+			obj, err := server.GetObject(bucketName, objectName)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(obj.Content, data) {
+				t.Error("content doesn't match what was uploaded")
+			}
+			if obj.Size != int64(len(data)) {
+				t.Errorf("wrong size\nwant %d\ngot  %d", len(data), obj.Size)
+			}
+			if want := checksum.EncodedCrc32cChecksum(data); obj.Crc32c != want {
+				t.Errorf("wrong crc32c\nwant %q\ngot  %q", want, obj.Crc32c)
+			}
+			if want := checksum.EncodedMd5Hash(data); obj.Md5Hash != want {
+				t.Errorf("wrong md5\nwant %q\ngot  %q", want, obj.Md5Hash)
+			}
+			if files := uploadSessionFiles(server); len(files) != 0 {
+				t.Errorf("temporary files left behind: %v", files)
+			}
+		}
+
+		t.Run("known total", func(t *testing.T) {
+			uploadURL := startResumableUpload(t, server, bucketName, "known-total", "{}")
+			uploadChunks(t, server, uploadURL, data, 256*1024)
+			check(t, "known-total")
+		})
+
+		t.Run("unknown total", func(t *testing.T) {
+			uploadURL := startResumableUpload(t, server, bucketName, "unknown-total", "{}")
+			const chunkSize = 256 * 1024
+			for start := 0; start < len(data); start += chunkSize {
+				end := min(start+chunkSize, len(data))
+				contentRange := fmt.Sprintf("bytes %d-%d/*", start, end-1)
+				if status := putChunk(t, server, uploadURL, data[start:end], contentRange); status != http.StatusPermanentRedirect {
+					t.Fatalf("wrong status for %q: %d", contentRange, status)
+				}
+			}
+			if status := putChunk(t, server, uploadURL, nil, fmt.Sprintf("bytes */%d", len(data))); status != http.StatusOK {
+				t.Fatalf("wrong status finalizing upload: %d", status)
+			}
+			check(t, "unknown-total")
+		})
+	})
+}
+
+func TestServerResumableUploadDeclaredChecksumMismatch(t *testing.T) {
+	const bucketName = "testbucket"
+	data := randomContent(t, 3*1024)
+
+	runServersTest(t, runServersOptions{enableFSBackend: true}, func(t *testing.T, server *Server) {
+		server.CreateBucketWithOpts(CreateBucketOpts{Name: bucketName})
+		metadata := fmt.Sprintf(`{"md5Hash": %q}`, checksum.EncodedMd5Hash([]byte("something else")))
+		uploadURL := startResumableUpload(t, server, bucketName, "mismatch", metadata)
+		if status := putChunk(t, server, uploadURL, data[:1024], "bytes 0-1023/3072"); status != http.StatusPermanentRedirect {
+			t.Fatalf("wrong status for first chunk: %d", status)
+		}
+		files := uploadSessionFiles(server)
+		if len(files) != 1 {
+			t.Fatalf("expected one temporary file, got %v", files)
+		}
+		if status := putChunk(t, server, uploadURL, data[1024:], "bytes 1024-3071/3072"); status != http.StatusBadRequest {
+			t.Fatalf("wrong status for last chunk: %d", status)
+		}
+		if _, err := server.GetObject(bucketName, "mismatch"); err == nil {
+			t.Error("object was created despite the checksum mismatch")
+		}
+		if _, err := os.Stat(files[0]); !os.IsNotExist(err) {
+			t.Errorf("temporary file was not removed: %v", err)
+		}
+	})
+}
+
+func TestServerResumableUploadExpiry(t *testing.T) {
+	const bucketName = "testbucket"
+
+	server, err := NewServerWithOptions(Options{NoListener: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Stop()
+	server.CreateBucketWithOpts(CreateBucketOpts{Name: bucketName})
+
+	abandoned := startResumableUpload(t, server, bucketName, "abandoned", "{}")
+	if status := putChunk(t, server, abandoned, []byte("partial"), "bytes 0-6/*"); status != http.StatusPermanentRedirect {
+		t.Fatalf("wrong status for chunk: %d", status)
+	}
+	files := uploadSessionFiles(server)
+	if len(files) != 1 {
+		t.Fatalf("expected one temporary file, got %v", files)
+	}
+
+	// Sessions that were touched recently survive the creation of others.
+	startResumableUpload(t, server, bucketName, "other", "{}")
+	if _, err := os.Stat(files[0]); err != nil {
+		t.Fatalf("temporary file of an active upload is gone: %v", err)
+	}
+
+	server.uploads.Range(func(_, value any) bool {
+		value.(*resumableUploadEntry).touched = time.Now().Add(-2 * resumableUploadTTL)
+		return true
+	})
+	startResumableUpload(t, server, bucketName, "another", "{}")
+	if _, err := os.Stat(files[0]); !os.IsNotExist(err) {
+		t.Errorf("temporary file of an abandoned upload was not removed: %v", err)
+	}
+	if status := putChunk(t, server, abandoned, []byte("more"), "bytes 7-10/11"); status != http.StatusNotFound {
+		t.Errorf("wrong status for chunk of an expired upload: %d", status)
+	}
+}
+
+func TestServerResumableUploadStopRemovesTemporaryFiles(t *testing.T) {
+	server, err := NewServerWithOptions(Options{NoListener: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.CreateBucketWithOpts(CreateBucketOpts{Name: "testbucket"})
+	uploadURL := startResumableUpload(t, server, "testbucket", "object", "{}")
+	putChunk(t, server, uploadURL, []byte("partial"), "bytes 0-6/*")
+	files := uploadSessionFiles(server)
+	if len(files) != 1 {
+		t.Fatalf("expected one temporary file, got %v", files)
+	}
+	server.Stop()
+	if _, err := os.Stat(files[0]); !os.IsNotExist(err) {
+		t.Errorf("temporary file was not removed: %v", err)
+	}
+}
+
+func TestServerMultipartUploadStreamed(t *testing.T) {
+	const bucketName = "testbucket"
+	data := randomContent(t, 1024*1024+7)
+
+	multipartBody := func(t *testing.T, metadata string) (io.Reader, string) {
+		t.Helper()
+		var buf bytes.Buffer
+		writer := multipart.NewWriter(&buf)
+		part, err := writer.CreatePart(textproto.MIMEHeader{"Content-Type": {"application/json"}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		part.Write([]byte(metadata))
+		part, err = writer.CreatePart(textproto.MIMEHeader{"Content-Type": {"application/x-test"}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		part.Write(data)
+		if err := writer.Close(); err != nil {
+			t.Fatal(err)
+		}
+		return &buf, writer.FormDataContentType()
+	}
+	upload := func(t *testing.T, server *Server, objectName, metadata string) int {
+		t.Helper()
+		body, contentType := multipartBody(t, metadata)
+		url := fmt.Sprintf("%s/upload/storage/v1/b/%s/o?uploadType=multipart&name=%s", server.URL(), bucketName, objectName)
+		resp, err := server.HTTPClient().Post(url, strings.Replace(contentType, "form-data", "related", 1), body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		_, _ = io.Copy(io.Discard, resp.Body)
+		return resp.StatusCode
+	}
+
+	runServersTest(t, runServersOptions{enableFSBackend: true}, func(t *testing.T, server *Server) {
+		server.CreateBucketWithOpts(CreateBucketOpts{Name: bucketName})
+
+		t.Run("round trip", func(t *testing.T) {
+			metadata := fmt.Sprintf(`{"crc32c": %q, "metadata": {"k": "v"}}`, checksum.EncodedCrc32cChecksum(data))
+			if status := upload(t, server, "roundtrip", metadata); status != http.StatusOK {
+				t.Fatalf("wrong status: %d", status)
+			}
+			obj, err := server.GetObject(bucketName, "roundtrip")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(obj.Content, data) {
+				t.Error("content doesn't match what was uploaded")
+			}
+			if want := checksum.EncodedMd5Hash(data); obj.Md5Hash != want {
+				t.Errorf("wrong md5\nwant %q\ngot  %q", want, obj.Md5Hash)
+			}
+			if obj.ContentType != "application/x-test" || obj.Metadata["k"] != "v" {
+				t.Errorf("wrong attributes: %+v", obj.ObjectAttrs)
+			}
+		})
+
+		t.Run("declared checksum mismatch", func(t *testing.T) {
+			metadata := fmt.Sprintf(`{"md5Hash": %q}`, checksum.EncodedMd5Hash([]byte("something else")))
+			if status := upload(t, server, "mismatch", metadata); status != http.StatusBadRequest {
+				t.Fatalf("wrong status: %d", status)
+			}
+			if _, err := server.GetObject(bucketName, "mismatch"); err == nil {
+				t.Error("object was created despite the checksum mismatch")
+			}
+		})
+	})
+}
+
+func TestServerResumableUploadBoundedMemory(t *testing.T) {
+	if testing.Short() {
+		t.Skip("uploads a large object")
+	}
+	const (
+		bucketName = "testbucket"
+		size       = 128 << 20
+		chunkSize  = 4 << 20
+	)
+	server, err := NewServerWithOptions(Options{NoListener: true, StorageRoot: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Stop()
+	server.CreateBucketWithOpts(CreateBucketOpts{Name: bucketName})
+	data := randomContent(t, size)
+
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	uploadURL := startResumableUpload(t, server, bucketName, "big", "{}")
+	uploadChunks(t, server, uploadURL, data, chunkSize)
+	runtime.ReadMemStats(&after)
+
+	// Buffering the object would allocate at least its size, many times over
+	// when accumulating chunks and recomputing the checksums.
+	allocated := after.TotalAlloc - before.TotalAlloc
+	if allocated > size/4 {
+		t.Errorf("allocated %d MiB while uploading a %d MiB object", allocated>>20, size>>20)
+	}
+
+	obj, err := server.Backend().GetObject(bucketName, "big")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer obj.Close()
+	if obj.Size != size {
+		t.Errorf("wrong size\nwant %d\ngot  %d", size, obj.Size)
+	}
+	if want := checksum.EncodedMd5Hash(data); obj.Md5Hash != want {
+		t.Errorf("wrong md5\nwant %q\ngot  %q", want, obj.Md5Hash)
 	}
 }

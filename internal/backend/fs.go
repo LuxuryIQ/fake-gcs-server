@@ -24,6 +24,11 @@ import (
 	"github.com/pkg/xattr"
 )
 
+// tempObjectPrefix is the name prefix of the temporary files object content is
+// written to before being moved into place. Leftovers from a crashed write are
+// ignored when listing objects.
+const tempObjectPrefix = ".tmp-object-"
+
 // storageFS is an implementation of the backend storage that stores data on disk
 //
 // The layout is the following:
@@ -244,6 +249,33 @@ func (s *storageFS) CreateObject(obj StreamingObject, conditions Conditions) (St
 	// filesystem backend and handle generations outside of the backends.
 	obj.Generation = time.Now().UnixNano() / 1000
 
+	path := filepath.Join(s.rootDir, url.PathEscape(obj.BucketName), obj.Name)
+	isDir := strings.HasSuffix(obj.Name, "/")
+
+	// The content is streamed into a temporary file in the destination
+	// directory before taking the lock, so a slow upload doesn't block the
+	// backend. It is moved into place once the preconditions are checked.
+	var tmpName string
+	hasher := checksum.NewStreamingHasher()
+	if !isDir {
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			return StreamingObject{}, err
+		}
+		tmp, err := os.CreateTemp(filepath.Dir(path), tempObjectPrefix+"*")
+		if err != nil {
+			return StreamingObject{}, err
+		}
+		tmpName = tmp.Name()
+		defer os.Remove(tmpName) // no-op once renamed
+		if _, err = io.Copy(io.MultiWriter(tmp, hasher), obj.Content); err != nil {
+			tmp.Close()
+			return StreamingObject{}, err
+		}
+		if err = tmp.Close(); err != nil {
+			return StreamingObject{}, err
+		}
+	}
+
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
 	err := s.createBucket(obj.BucketName, BucketAttrs{VersioningEnabled: false})
@@ -263,23 +295,13 @@ func (s *storageFS) CreateObject(obj StreamingObject, conditions Conditions) (St
 		return StreamingObject{}, PreConditionFailed
 	}
 
-	path := filepath.Join(s.rootDir, url.PathEscape(obj.BucketName), obj.Name)
-	if err = os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return StreamingObject{}, err
-	}
-
 	// Nothing to do if this operation only creates directories
-	if strings.HasSuffix(obj.Name, "/") {
+	if isDir {
+		if err = os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			return StreamingObject{}, err
+		}
 		// TODO: populate Crc32c, Md5Hash, and Etag
 		return StreamingObject{obj.ObjectAttrs, noopSeekCloser{bytes.NewReader([]byte{})}}, nil
-	}
-
-	var buf bytes.Buffer
-	hasher := checksum.NewStreamingHasher()
-	objectContent := io.TeeReader(obj.Content, hasher)
-
-	if _, err = io.Copy(&buf, objectContent); err != nil {
-		return StreamingObject{}, err
 	}
 
 	if obj.Crc32c == "" {
@@ -301,7 +323,7 @@ func (s *storageFS) CreateObject(obj StreamingObject, conditions Conditions) (St
 		return StreamingObject{}, err
 	}
 
-	if err := writeFile(path, buf.Bytes(), 0o600); err != nil {
+	if err := os.Rename(tmpName, path); err != nil {
 		return StreamingObject{}, err
 	}
 
@@ -328,7 +350,7 @@ func (s *storageFS) ListObjects(bucketName string, prefix string, versions bool)
 		}
 
 		objName, _ := filepath.Rel(bucketPath, path)
-		if s.mh.isSpecialFile(info.Name()) {
+		if s.mh.isSpecialFile(info.Name()) || strings.HasPrefix(info.Name(), tempObjectPrefix) {
 			return nil
 		}
 		if info.IsDir() {

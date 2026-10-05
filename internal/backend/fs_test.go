@@ -6,9 +6,14 @@ package backend
 
 import (
 	"encoding/json"
+	"errors"
+	"io"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/google/go-cmp/cmp"
 )
@@ -73,3 +78,117 @@ func TestGetAttributes(t *testing.T) {
 		})
 	}
 }
+
+func TestCreateObjectStreamsContentToDisk(t *testing.T) {
+	t.Parallel()
+
+	rootDir := t.TempDir()
+	storage, err := NewStorageFS(nil, rootDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const content = "some nice content"
+	obj, err := storage.CreateObject(StreamingObject{
+		ObjectAttrs: ObjectAttrs{BucketName: "bucket", Name: "dir/object"},
+		Content:     noopSeekCloser{strings.NewReader(content)},
+	}, NoConditions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer obj.Close()
+	got, err := io.ReadAll(obj.Content)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != content {
+		t.Errorf("wrong content\nwant %q\ngot  %q", content, got)
+	}
+	if obj.Size != int64(len(content)) || obj.Md5Hash == "" || obj.Crc32c == "" {
+		t.Errorf("incomplete attributes: %+v", obj.ObjectAttrs)
+	}
+
+	// A leftover temporary file, e.g. from a killed process, must not break
+	// listing.
+	leftover := filepath.Join(rootDir, "bucket", "dir", tempObjectPrefix+"123")
+	if err := os.WriteFile(leftover, []byte("partial"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	objs, err := storage.ListObjects("bucket", "", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(objs) != 1 || objs[0].Name != "dir/object" {
+		t.Errorf("wrong objects listed: %+v", objs)
+	}
+	entries, err := os.ReadDir(filepath.Join(rootDir, "bucket", "dir"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), tempObjectPrefix) && e.Name() != filepath.Base(leftover) {
+			t.Errorf("temporary file left behind: %s", e.Name())
+		}
+	}
+}
+
+func TestCreateObjectDoesNotBlockWhileReadingContent(t *testing.T) {
+	t.Parallel()
+
+	storage, err := NewStorageFS(nil, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := storage.CreateBucket("bucket", BucketAttrs{}); err != nil {
+		t.Fatal(err)
+	}
+
+	// An upload whose content doesn't arrive until the end of the test.
+	pr, pw := io.Pipe()
+	reading := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		obj, err := storage.CreateObject(StreamingObject{
+			ObjectAttrs: ObjectAttrs{BucketName: "bucket", Name: "slow"},
+			Content:     &unseekable{ReadCloser: pr, reading: reading},
+		}, NoConditions{})
+		if err == nil {
+			obj.Close()
+		}
+		done <- err
+	}()
+
+	<-reading
+	listed := make(chan error, 1)
+	go func() {
+		_, err := storage.ListObjects("bucket", "", false)
+		listed <- err
+	}()
+	select {
+	case err := <-listed:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("ListObjects blocked by an upload in progress")
+	}
+
+	pw.Write([]byte("content"))
+	pw.Close()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+// unseekable closes reading when its content is first read.
+type unseekable struct {
+	io.ReadCloser
+	reading chan struct{}
+	once    sync.Once
+}
+
+func (u *unseekable) Read(p []byte) (int, error) {
+	u.once.Do(func() { close(u.reading) })
+	return u.ReadCloser.Read(p)
+}
+
+func (*unseekable) Seek(int64, int) (int64, error) { return 0, errors.New("not seekable") }
