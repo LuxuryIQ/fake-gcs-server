@@ -25,8 +25,7 @@ import (
 )
 
 // tempObjectPrefix is the name prefix of the temporary files object content is
-// written to before being moved into place. Leftovers from a crashed write are
-// ignored when listing objects.
+// written to before being moved into place.
 const tempObjectPrefix = ".tmp-object-"
 
 // storageFS is an implementation of the backend storage that stores data on disk
@@ -350,7 +349,7 @@ func (s *storageFS) ListObjects(bucketName string, prefix string, versions bool)
 		}
 
 		objName, _ := filepath.Rel(bucketPath, path)
-		if s.mh.isSpecialFile(info.Name()) || strings.HasPrefix(info.Name(), tempObjectPrefix) {
+		if s.mh.isSpecialFile(info.Name()) {
 			return nil
 		}
 		if info.IsDir() {
@@ -361,6 +360,11 @@ func (s *storageFS) ListObjects(bucketName string, prefix string, versions bool)
 		}
 		objAttrs, err := s.getObjectAttrs(bucketName, objName)
 		if err != nil {
+			// A write in progress, or one cut short by a crash, leaves a hidden
+			// temporary file without metadata. It is not an object.
+			if strings.HasPrefix(info.Name(), ".") {
+				return nil
+			}
 			return err
 		}
 		objects = append(objects, objAttrs)

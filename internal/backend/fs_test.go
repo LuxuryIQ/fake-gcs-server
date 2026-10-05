@@ -107,25 +107,41 @@ func TestCreateObjectStreamsContentToDisk(t *testing.T) {
 		t.Errorf("incomplete attributes: %+v", obj.ObjectAttrs)
 	}
 
-	// A leftover temporary file, e.g. from a killed process, must not break
-	// listing.
-	leftover := filepath.Join(rootDir, "bucket", "dir", tempObjectPrefix+"123")
-	if err := os.WriteFile(leftover, []byte("partial"), 0o600); err != nil {
+	// A hidden object written through the API is listed.
+	hidden, err := storage.CreateObject(StreamingObject{
+		ObjectAttrs: ObjectAttrs{BucketName: "bucket", Name: "dir/.keep"},
+		Content:     noopSeekCloser{strings.NewReader("")},
+	}, NoConditions{})
+	if err != nil {
 		t.Fatal(err)
+	}
+	hidden.Close()
+
+	// Leftover temporary files from a killed process, ours and those of earlier
+	// versions (".<name><random>"), must not break listing.
+	for _, name := range []string{tempObjectPrefix + "123", ".object8129590202668251472"} {
+		leftover := filepath.Join(rootDir, "bucket", "dir", name)
+		if err := os.WriteFile(leftover, []byte("partial"), 0o600); err != nil {
+			t.Fatal(err)
+		}
 	}
 	objs, err := storage.ListObjects("bucket", "", false)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(objs) != 1 || objs[0].Name != "dir/object" {
-		t.Errorf("wrong objects listed: %+v", objs)
+	var names []string
+	for _, o := range objs {
+		names = append(names, o.Name)
+	}
+	if diff := cmp.Diff([]string{"dir/.keep", "dir/object"}, names); diff != "" {
+		t.Errorf("wrong objects listed (-want +got):\n%s", diff)
 	}
 	entries, err := os.ReadDir(filepath.Join(rootDir, "bucket", "dir"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	for _, e := range entries {
-		if strings.HasPrefix(e.Name(), tempObjectPrefix) && e.Name() != filepath.Base(leftover) {
+		if strings.HasPrefix(e.Name(), tempObjectPrefix) && e.Name() != tempObjectPrefix+"123" {
 			t.Errorf("temporary file left behind: %s", e.Name())
 		}
 	}
